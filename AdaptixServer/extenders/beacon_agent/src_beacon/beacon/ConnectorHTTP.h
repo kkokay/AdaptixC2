@@ -3,13 +3,18 @@
 #include <windows.h>
 #include <wininet.h>
 #include "Connector.h"
+#include "Crypt_ChaCha20.h"
 
-#ifndef PROFILE_STRUCT
-#define PROFILE_STRUCT
+// Encryption method constants
+#define ENC_RC4             0
+#define ENC_CHACHA20        1
 
 #define PROXY_TYPE_NONE     0
 #define PROXY_TYPE_HTTP     1
 #define PROXY_TYPE_HTTPS    2
+
+#ifndef PROFILE_STRUCT
+#define PROFILE_STRUCT
 
 typedef struct {
 	ULONG  servers_count;
@@ -33,6 +38,7 @@ typedef struct {
 	WORD   proxy_port;
 	BYTE*  proxy_username;
 	BYTE*  proxy_password;
+	BYTE   encryption_method;  // 0=RC4, 1=ChaCha20 (default: 0 for compatibility)
 } ProfileHTTP;
 
 typedef struct {
@@ -102,6 +108,11 @@ class ConnectorHTTP : public Connector
 	HINTERNET hConnect  = NULL;
 
 	ULONG server_index = 0;
+
+	// Encryption support (RC4 or ChaCha20)
+	BYTE   encryption_method = ENC_RC4;  // Default: RC4 for compatibility
+	BYTE   chacha20_nonce[12] = {0};     // Nonce for ChaCha20 (12 bytes)
+	BYTE   chacha20_hmac_key[32] = {0};  // HMAC key derived from encryption key
 
 public:
 	ConnectorHTTP();
